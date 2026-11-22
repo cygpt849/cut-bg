@@ -1,0 +1,123 @@
+# MODEL_CARD — QMix Cut-512 (BiRefNet_lite, ONNX, 512×512)
+
+Current record for the model served by this project. See also
+`THIRD_PARTY_LEGAL_NOTICES.md` (hashes/licences), `LICENSE_AUDIT.md`
+(dependency/model audit), and `PHASE1_REPORT.md` (measured results and verdict).
+
+## Product name vs architecture
+
+- **Product name**: **QMix Cut-512** — the name shown in the UI (`#modelName`).
+- **Technical model ID**: `qmix-cut-512` — the manifest `id` and the value the
+  UI prints as the "Technical model ID".
+- **Architecture**: this is **not** a newly trained model. It is an optimised
+  **BiRefNet Lite** variant (the optimised export described under "Shipped
+  artifact" below). BiRefNet attribution is retained throughout this card and in
+  `THIRD_PARTY_LEGAL_NOTICES.md`.
+- The physical file keeps its precision-stating name
+  (`model_512_int8_fp16.onnx`); only the product name/ID changed.
+
+## Identity
+
+- **Upstream model**: `ZhengPeng7/BiRefNet_lite`
+  - Model page: https://huggingface.co/ZhengPeng7/BiRefNet_lite
+  - Verified HF commit: `aa62cd87eafb9cc43056d08ef3615a14628b831d`
+    ("Complete the MIT license in the model card", 2026-08-29; `license: mit`
+    in card YAML and `license:mit` tag; verified 2026-10-25)
+  - Source repository: https://github.com/ZhengPeng7/BiRefNet
+  - Published licence declaration on the model card: MIT
+- **Source ONNX export**: `Phoenix-ActuallyFree/BiRefNet_lite_512-ONNX`
+  - Model page: https://huggingface.co/Phoenix-ActuallyFree/BiRefNet_lite_512-ONNX
+  - Exact file: `onnx/model.onnx`
+  - Size: 193,514,682 bytes (≈185 MB)
+  - SHA-256: `eaafaa10f19c63b77e2bae77bf4b2f59054c208ea08b8c6648f95ef36a3b6b87`
+  - Fixed input: 512×512
+- **Type**: third-party ONNX export (fp32) of the upstream checkpoint — **not**
+  an upstream file.
+- **Shipped artifact**: the file below is the fp32 export above with
+  **weight-only quantised storage materialised back to fp32 compute**, so the
+  runtime kernels, the input/output contract, and the model behaviour are
+  unchanged; only the on-disk size differs. It is served from the
+  `Octoborg/remove-photo-bg` Hugging Face Space and pinned by SHA-256 in
+  `public/models-manifest.json`.
+
+  | id (manifest) | file | size | method | role |
+  |---|---|---|---|---|
+  | `qmix-cut-512` (product name **QMix Cut-512**) | `model_512_int8_fp16.onnx` | 60,763,193 B (≈58 MB) | per-output-channel **int8** for the backbone (`m.bb.*`, `m.squeeze_module.*`) + **fp16** decoder, all cast back to fp32; PyTorch debug metadata and duplicate initializers stripped (lossless) | **the only model served** |
+
+  Earlier builds also offered `model_512_int0_fp16` and `model_512_int0_fp32`.
+  They are the same graph at higher weight-storage precision; because every
+  variant is materialised to fp32, the larger two produced no visible
+  difference, so they were dropped and the smallest is served alone.
+
+  **Measured parity of the default vs the fp32 teacher** (browser, WASM,
+  `glass-wine.jpg`): IoU@0.5 **0.998726**, **0** pixels crossing the 0.5
+  threshold; the fp16 variant 0.999944 / 0 flips. Session load 2075 → ~950 ms.
+  The strict ≤0.02 per-pixel gate is **not** met (max 0.10–0.14,
+  boundary-dominated) — recorded honestly, not hidden. The output head
+  (`expand_*`/`sub_*`/`index_*`) must stay fp16: quantising it flips >1000
+  pixels, which is why "quantise everything" collapses.
+  **Wider-set caveat:** on the 62-image eval set the default averages IoU@0.5
+  0.981 vs the teacher and has one catastrophic failure (`clothing-04.jpg`,
+  IoU 0.0). The fp32 teacher is numerically knife-edge on that image — input
+  noise of σ=0.01 already collapses its mask to empty — so the int8 backbone
+  error tips it over. The fp16 variant stays safe (mean 0.99989, min 0.9977).
+  Full measurements in `OPTIMIZATION_REPORT.md`.
+- **Provenance verification performed** (against
+  `ZhengPeng7/BiRefNet_lite` `model.safetensors`, 586 tensors):
+  - All 379 backbone tensors that map by name are bit-identical (max abs
+    difference < 1e-5).
+  - The 36 decoder/squeeze convolutions that differ are the upstream weights
+    with BatchNorm folded in. Recomputing the fold
+    (`w * gamma / sqrt(var + eps)`, `(b - mean) * scale + beta`) reproduces the
+    ONNX values to ~1e-7, i.e. float32 rounding only.
+  - Conclusion: the published file is a faithful export of the official
+    checkpoint with BN folding and a 512×512 fixed input. This matters because
+    the exporting repository is a personal account, not an org.
+
+## Model details
+
+| Aspect | Value |
+|---|---|
+| Purpose | Binary segmentation / background removal |
+| Input | `input_image` — float32, fixed `[1, 3, 512, 512]` (NCHW, channel-first) |
+| Input fixed vs dynamic | **Fixed 512×512** — no dynamic smaller-input fallback |
+| Normalization | Fit to 512×512 bilinear, **aspect-ratio-preserving** (letterbox; border filled by **edge replication**, not a flat colour) → /255 → ImageNet `mean=[0.485,0.456,0.406]`, `std=[0.229,0.224,0.225]` |
+| Output | `output_image` — `[1, 1, 512, 512]` probabilities in `[0,1]` |
+| Activation | Sigmoid is **baked into the graph**; the output is already a probability map. Do not apply sigmoid again. |
+| Postprocessing | Crop the letterbox border off the mask, then upscale the content to original dimensions (bilinear), use as alpha over the original pixels |
+| Runtime | onnxruntime-web 1.29.0 — GPU (WebGPU) when the browser exposes an adapter **and** the host serves the WebGPU-capable ORT bundle, else CPU (WASM) |
+| Peak transient memory | ~1.1 GB at 512×512 (was ~1.5 GB at 1024×1024 on native CPU) |
+
+## Alternative 512 exports reviewed and rejected (2026-10-25)
+
+`studioludens/birefnet-lite-512` and its mirror `BRPOD123/birefnet-lite-512`
+both provide MIT-licensed 512×512 ONNX exports. They were **not adopted**:
+
+| Export | Size | Output contract | WASM warm inference (headless Chromium) |
+|---|---|---|---|
+| `studioludens` / `BRPOD123` fp16 | 98,484,532 B (≈94 MB) | logits (sigmoid by caller) | ≈219 s — **51× slower** than shipped |
+| `studioludens` / `BRPOD123` fp32 | 191,877,254 B (≈183 MB) | logits (sigmoid by caller) | ≈5.7 s (1.3× slower than shipped) |
+| **Shipped** 512 fp32 (Phoenix) | 193,514,682 B (≈185 MB) | probabilities (sigmoid baked in) | ≈4.3 s |
+
+The fp16 export's WASM stall is an onnxruntime-web limitation: WASM has no
+native float16 compute, so ORT interposes casts around every fp16 tensor,
+making the 17,490-node graph ~236× slower than its native-CPU runtime. The
+fp32 export gives no size benefit. Details and measured numbers:
+`THIRD_PARTY_LEGAL_NOTICES.md` → "Alternative 512 exports reviewed (not
+adopted)", `PHASE1_REPORT.md` → §Model-artifact review.
+
+## Provenance / training-data note
+
+Per MVP_OPENHANDS.md §3: the MIT licence declaration from the official model
+page is the project's implementation basis. This is not a claim that every
+question about training data has been adjudicated. Date checked: 2026-10-24
+(upstream commit `aa62cd87` re-verified 2026-10-25).
+
+## Distribution note
+
+- Served from the `Octoborg/remove-photo-bg` Hugging Face Space and proxied
+  same-origin by the app's service worker; the WASM runtime ships same-origin
+  from the app itself.
+- Re-downloadable and verifiable via `npm run fetch-models` (fails on SHA-256 mismatch).
+- Download size: **60.8 MB** (`model_512_int8_fp16`), under the Phase-1 100 MB
+  download-size flag.

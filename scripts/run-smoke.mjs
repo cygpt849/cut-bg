@@ -1,0 +1,260 @@
+// Headless smoke-test driver for the Phase 2 harness.
+//
+// Usage:
+//   node scripts/run-smoke.mjs <page-url> [--image <path-or-url>] [--out <dir>] [--runs <n>] [--model <id>] [--provider <wasm|webgpu>]
+//   RUN_GPU=1 node scripts/run-smoke.mjs <page-url> ...  # optional: do NOT pass
+//     --disable-gpu/--disable-webgpu (use on a real GPU, e.g. Colab T4; the
+//     sandbox/CI must keep the default)
+//
+// Launches the system Chromium, opens the page, waits for the auto-loaded model
+// (or first changes the selection via ?model= / ?provider= then waits), runs n
+// inferences (default 1), collects results (timings, provider, measures index),
+// the output PNG data URL (saved to <out>/), and a log of network requests made
+// during processing (to verify no image pixels leave the page).
+import puppeteer from 'puppeteer-core';
+import { browserArgs, headlessMode, gpuRequested, assertHardwareGpu } from './lib/gpu-browser.mjs';
+
+const argUrl = process.argv[2];
+if (!argUrl) {
+  console.error('Usage: node scripts/run-smoke.mjs <page-url> [--image <path-or-url>] [--out <dir>] [--runs <n>] [--model <id>] [--provider <wasm|webgpu>]');
+  process.exit(1);
+}
+const imgIdx = process.argv.indexOf('--image');
+const image = imgIdx >= 0 ? process.argv[imgIdx + 1] : null;
+const outIdx = process.argv.indexOf('--out');
+const outDir = outIdx >= 0 ? process.argv[outIdx + 1] : './smoke-results';
+const runsIdx = process.argv.indexOf('--runs');
+const requestedRuns = runsIdx >= 0 ? Number(process.argv[runsIdx + 1]) : 1;
+const runs = Number.isFinite(requestedRuns) && requestedRuns >= 1 ? Math.floor(requestedRuns) : 1;
+const modelIdx = process.argv.indexOf('--model');
+const wantedModel = modelIdx >= 0 ? process.argv[modelIdx + 1] : null;
+const providerIdx = process.argv.indexOf('--provider');
+const wantedProvider = providerIdx >= 0 ? process.argv[providerIdx + 1] : null;
+// --refine off runs the A/B baseline: the app's Stage-1-only path, no edge
+// refinement (same override a tester would use via ?refine=off).
+const refineIdx = process.argv.indexOf('--refine');
+const wantedRefine = refineIdx >= 0 ? process.argv[refineIdx + 1] : null;
+
+// ?model=/?provider=/?refine= drive the app's own overrides (same path a tester
+// would use); unknown values are ignored by the app, so the smoke run would then
+// test whatever the default is. Fail loudly instead so a typo is never "green".
+function injectOverrides(url) {
+  const u = new URL(url);
+  if (wantedModel) u.searchParams.set('model', wantedModel);
+  if (wantedProvider) u.searchParams.set('provider', wantedProvider);
+  if (wantedRefine) u.searchParams.set('refine', wantedRefine);
+  return u.toString();
+}
+
+const CHROME = process.env.CHROME_BIN || '/usr/bin/chromium';
+
+// Default: run CPU-only (sandbox/CI Chromium has no GPU). Set RUN_GPU=1 when the
+// browser really has a usable GPU (the Colab T4 headless recipe): that switches
+// to the new headless mode and the Vulkan/WebGPU flags the GPU path needs.
+const args = browserArgs(process.env, ['--enable-logging=stderr']);
+
+const browser = await puppeteer.launch({
+  executablePath: CHROME,
+  headless: headlessMode(),
+  args,
+  protocolTimeout: 3600000,
+  timeout: 3600000,
+});
+
+const page = await browser.newPage();
+// Record every network request the page makes.
+const requests = [];
+page.on('request', (req) => {
+  const url = req.url();
+  // Filter noise (data: URLs, favicon, devtools).
+  if (url.startsWith('data:')) return;
+  requests.push({
+    method: req.method(),
+    url: url.slice(0, 200),
+    resourceType: req.resourceType(),
+  });
+});
+page.on('console', (msg) => {
+  const t = msg.text();
+  if (t.includes('log') || t.includes('error')) console.log('[console]', t.slice(0, 300));
+});
+page.on('pageerror', (err) => console.error('[pageerror]', err.message));
+
+const results = {};
+page.on('dialog', async (d) => d.dismiss());
+
+await page.goto(injectOverrides(argUrl), { waitUntil: 'load', timeout: 120000 });
+
+// On a GPU host, confirm the adapter is real hardware before the run: a software
+// renderer (SwiftShader/llvmpipe) means the flags or drivers are wrong and any
+// "webgpu" timing would be a lie. Fail cleanly instead of dumping a stack trace.
+if (gpuRequested()) {
+  try {
+    const { label } = await assertHardwareGpu(page);
+    console.log('WebGPU adapter:', label);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    await browser.close().catch(() => {});
+    process.exit(1);
+  }
+}
+
+// Wait for the model to be ready (poll; the model download + WASM init can take
+// several minutes on first load).
+const modelReady = await page
+  .waitForFunction('window.smokeModelReady === true', { timeout: 600000 })
+  .then(() => true)
+  .catch(async () => {
+    const st = await page.evaluate(() => ({
+      stage: document.getElementById('processingLabel')?.textContent,
+      log: document.getElementById('consoleOutput')?.textContent,
+      ready: window.smokeModelReady,
+      provider: window.smokeProvider,
+      model: window.smokeModelId,
+    }));
+    console.error('Model did not become ready. Page state:', JSON.stringify(st, null, 2));
+    return false;
+  });
+
+if (!modelReady) {
+  await browser.close();
+  process.exit(1);
+}
+const readyInfo = await page.evaluate(() => ({
+  provider: window.smokeProvider,
+  model: window.smokeModelId,
+  maskThreshold: document.getElementById('maskThreshold')?.value ?? null,
+  maskFeather: document.getElementById('maskFeather')?.value ?? null,
+}));
+console.log('Model ready. Provider:', readyInfo.provider, '| Model:', readyInfo.model);
+if (wantedProvider && readyInfo.provider !== wantedProvider) {
+  console.error(`Expected provider ${wantedProvider}, got ${readyInfo.provider}`);
+  await browser.close();
+  process.exit(1);
+}
+if (wantedModel && readyInfo.model !== wantedModel) {
+  console.error(`Expected model ${wantedModel}, got ${readyInfo.model}`);
+  await browser.close();
+  process.exit(1);
+}
+
+const target = image || 'test-images/glass-wine.jpg';
+console.log(`Running smoke test on image: ${target} (${runs} run${runs > 1 ? 's' : ''})`);
+
+const envInfo = await page.evaluate(() => ({
+  crossOriginIsolated: globalThis.crossOriginIsolated === true,
+  hasSharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
+  wasmThreads: globalThis.WebAssembly?.ThreadsSupported ?? 'n/a',
+}));
+console.log('Browser env:', JSON.stringify(envInfo));
+
+const runResult = await page.evaluate(
+  async (img, n) => {
+    // Expose a promise that resolves when the run completes.
+    const result = await window.runSmoke(img, n);
+    return result;
+  },
+  target,
+  runs,
+);
+
+results.run = runResult;
+results.provider = await page.evaluate(() => window.smokeProvider);
+// Per-run refinement stage timings (upscale/filter/cleanup/total). Null when the
+// run used the A/B baseline (?refine=off) or refinement failed.
+results.refineStages = await page.evaluate(() => window.smokeRefineStages ?? null);
+
+// The structured diagnostic report: GPU adapter facts, the provider that
+// actually executed inference, and — most importantly for the "washed-out ghost"
+// investigation — the raw mask's min/mean/max and tail fractions, measured from
+// the model's ORIGINAL output before any post-processing.
+results.diagnosticReport = await page.evaluate(() => window.diagnosticReport?.() ?? null);
+if (results.diagnosticReport?.rawMask) {
+  const m = results.diagnosticReport.rawMask;
+  console.log(
+    `Raw mask: min ${m.min.toFixed(4)} / mean ${m.mean.toFixed(4)} / max ${m.max.toFixed(4)} ` +
+      `(below 0.01 ${(m.below_001_fraction * 100).toFixed(2)}%, above 0.95 ${(m.above_095_fraction * 100).toFixed(2)}%)`,
+  );
+}
+
+// Grab the output PNG data URL + the console text.
+results.outputPngDataUrl = await page.evaluate(() => {
+  const img = document.querySelector('#outputBox img');
+  return img ? img.getAttribute('src') : null;
+});
+results.log = await page.evaluate(() => document.getElementById('consoleOutput')?.textContent);
+
+import { mkdirSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
+mkdirSync(outDir, { recursive: true });
+
+if (results.outputPngDataUrl) {
+  const b64 = results.outputPngDataUrl.split(',')[1];
+  writeFileSync(`${outDir}/output.png`, Buffer.from(b64, 'base64'));
+  console.log(`Saved output PNG to ${outDir}/output.png`);
+}
+// The "before" is the source image. When it is a local file, copy it beside the
+// output so a smoke run always leaves a before/after pair to eyeball.
+if (image && existsSync(image)) {
+  copyFileSync(image, `${outDir}/input.png`);
+  console.log(`Saved input PNG to ${outDir}/input.png`);
+}
+writeFileSync(`${outDir}/requests.json`, JSON.stringify(requests, null, 2));
+
+// Measures index: 0-100 reliability score for the timing measurements.
+// It rewards more runs and penalizes spread (coefficient of variation).
+const timings = Array.isArray(results.run?.timings) ? results.run.timings : [];
+const measuresIndex = (() => {
+  if (timings.length === 1) return 40; // one sample: no spread evidence, low trust
+  if (timings.length === 0) return 0;
+  const mean = timings.reduce((a, b) => a + b, 0) / timings.length;
+  const sd = Math.sqrt(
+    timings.reduce((a, b) => a + (b - mean) ** 2, 0) / timings.length,
+  );
+  const cv = mean > 0 ? sd / mean : 1; // coefficient of variation
+  // Base: runs help (log scale up to ~10); dispersion caps the score.
+  const runScore = Math.min(1, Math.log2(timings.length + 1) / Math.log2(11));
+  const stableScore = Math.max(0, 1 - cv); // 1.0 = perfectly stable
+  return Math.round(100 * Math.sqrt(runScore * stableScore));
+})();
+
+writeFileSync(
+  `${outDir}/summary.json`,
+  JSON.stringify(
+    {
+      pageUrl: argUrl,
+      image: target,
+      provider: results.provider,
+      model: results.run?.modelId ?? readyInfo.model,
+      run: results.run,
+      refineStages: results.refineStages,
+      rawMask: results.diagnosticReport?.rawMask ?? null,
+      diagnosticReport: results.diagnosticReport,
+      measuresIndex,
+      pageLog: results.log,
+    },
+    null,
+    2,
+  ),
+);
+// Also save the human-readable diagnostic report, so a smoke run leaves the same
+// evidence a real-device tester would copy with the Console's Copy report button.
+if (results.diagnosticReport) {
+  const text = await page.evaluate(() => window.deviceReport?.() ?? '');
+  writeFileSync(`${outDir}/diagnostic-report.txt`, text);
+  console.log(`Saved diagnostic report to ${outDir}/diagnostic-report.txt`);
+}
+console.log(JSON.stringify({ ...results.run, measuresIndex }, null, 2));
+console.log(`Saved summary to ${outDir}/summary.json`);
+
+// Report whether any request could carry image pixels.
+const suspicious = requests.filter((r) =>
+  r.resourceType === 'fetch' || r.resourceType === 'xhr' || r.url.includes('api'),
+);
+console.log('--- requests during run ---');
+for (const r of requests.slice(0, 60)) {
+  console.log(`  ${r.method} ${r.resourceType} ${r.url}`);
+}
+console.log('--- suspicious (fetch/xhr/api) ---', suspicious.length);
+for (const r of suspicious) console.log('  ', r.method, r.resourceType, r.url);
+
+await browser.close();

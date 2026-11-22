@@ -1,0 +1,126 @@
+name: ci
+
+# Two independent gates on every change that can influence the app.
+#
+#   static-checks — lint, typecheck, and the unit suite (no browser, no model
+#                   download). Fast; catches the "green build, broken tests"
+#                   case the smoke job alone cannot see.
+#   wasm-smoke    — a real build served to real Chromium: the browser flow tests
+#                   (upload → inference → exports, error paths, privacy) plus the
+#                   WASM smoke runs. Class-2 "no WebGPU device" proxy: software
+#                   rendering is NOT a GPU, so this never produces WebGPU timings.
+#
+# Both fire only when the change can influence the pipeline they exercise
+# (source, runtime, model fetch/load, the harnesses, or build/dependency config).
+# Doc-only and CI-only edits skip them.
+on:
+  push:
+    branches: [main, staging, production]
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'scripts/**'
+      - 'test-images/**'
+      - 'eval/**'
+      - 'index.html'
+      - 'vite.config.ts'
+      - 'tsconfig.json'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/smoke.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'scripts/**'
+      - 'test-images/**'
+      - 'eval/**'
+      - 'index.html'
+      - 'vite.config.ts'
+      - 'tsconfig.json'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/smoke.yml'
+
+jobs:
+  # Lint + typecheck + unit tests. No Chromium and no model download, so this
+  # job is fast and runs even when the heavier smoke job would be wasteful.
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test
+      # The evaluation set is committed, so it can drift. Verify the pinned
+      # images still match the manifest (existence, size, SHA-256, dimensions)
+      # before anything depends on it. Offline; uses only the Python stdlib.
+      - name: Verify evaluation set
+        run: python3 scripts/eval/build-eval-set.py --verify
+      # The accuracy-benchmark metrics + gate logic must stay correct without a
+      # model or a browser. The self-test builds synthetic masks and asserts the
+      # verdicts, so a broken gate fails the build instead of shipping.
+      - name: Accuracy-benchmark self-test
+        run: |
+          python3 -m pip install --quiet numpy pillow
+          python3 scripts/eval/accuracy-benchmark.py --self-test
+
+  wasm-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      # Fetch the pinned model into public/ BEFORE build, so vite copies it
+      # into dist/ for preview to serve. The model is ~58 MB and gitignored, so
+      # every fresh checkout starts without it.
+      - run: npm run fetch-models
+      - run: npm run build
+      # Fail fast if the model did not survive the build; the preview can't
+      # serve what isn't in dist/.
+      - name: Verify model artifacts
+        run: |
+          test -s dist/models/model_512_int8_fp16.onnx
+          test -s dist/models-manifest.json
+      # puppeteer-core needs a real Chromium executable. Ubuntu 24.04+ only ships
+      # `chromium-browser` as a snap shim, so `apt-get install` hands off to snapd
+      # and pulls the whole GNOME snap stack (mesa-2404 alone ~40 min) — or fails
+      # outright when the snap preinst script errors. Install Chrome for Testing
+      # directly instead and point the harnesses at it via CHROME_BIN.
+      - name: Setup Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+      - name: Export CHROME_BIN for the harnesses
+        run: echo "CHROME_BIN=${{ steps.chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
+      - name: Verify Chrome
+        run: '"$CHROME_BIN" --version && test -x "$CHROME_BIN"'
+      # Real-browser flow tests: upload → inference → transparent PNG + JPG,
+      # error surfacing, keyboard access, and the no-third-party-request check.
+      # Runs its own dev server (which serves public/, where fetch-models put
+      # the model) and fails the job if any check fails.
+      - name: Browser flow tests
+        run: npm run test:browser
+      - name: Run WASM smoke
+        shell: bash
+        run: |
+          npx vite preview --port 4173 &
+          for i in $(seq 1 60); do
+            curl -s -o /dev/null http://localhost:4173 && break
+            sleep 1
+          done
+          # All CI runs force ?provider=wasm to keep results deterministic
+          # across software-rendered GitHub-hosted runners.
+          # Default (auto-loaded single model, model_512_int8_fp16).
+          node scripts/run-smoke.mjs "http://localhost:4173/?provider=wasm" --out smoke-results/ci-default
+          # Mask adjustments wired from the URL (exercises the load path).
+          node scripts/run-smoke.mjs "http://localhost:4173/?provider=wasm&maskThreshold=30&maskFeather=4" --out smoke-results/ci-mask

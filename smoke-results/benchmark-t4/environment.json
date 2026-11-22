@@ -1,0 +1,27 @@
+{
+  "artifact": "smoke-results/benchmark-t4/summary.json",
+  "run_date": "2026-10-28",
+  "capture_method": "machine-captured",
+  "capture_note": "Standalone mirror of the machine-captured 'environment' block written into summary.json on 2026-10-28 by scripts/benchmark-pipelines.py (git 873fc9c). Supersedes the transcribed 2026-10-26 environment.json.",
+  "platform": "Google Colab, T4 GPU runtime",
+  "gpu": {
+    "name": "Tesla T4",
+    "driver_version": "580.82.07",
+    "memory_total_mb": 15360.0
+  },
+  "python": "3.13.16",
+  "runtime": {
+    "package": "onnxruntime-gpu",
+    "version": "1.31.1",
+    "execution_provider": "CUDAExecutionProvider",
+    "providers_available": [
+      "TensorrtExecutionProvider",
+      "CUDAExecutionProvider",
+      "CPUExecutionProvider"
+    ]
+  },
+  "batch_size": 1,
+  "warm_reps": 10,
+  "served_by": "SSH over a Cloudflare TCP tunnel into the Colab session (Colab has no inbound ports; mechanism as in scripts/benchmark-pipelines.py)",
+  "captured_utc": "2026-10-28T05:28:00+00:00"
+}
